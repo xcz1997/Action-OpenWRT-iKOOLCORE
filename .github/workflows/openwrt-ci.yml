@@ -1,0 +1,178 @@
+name: OpenWrt-CI
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+  # schedule:
+  #   - cron: 0 20 * * *
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/coolsnowwolf/lede
+  # REPO_BRANCH: 20221001
+  REPO_BRANCH: master
+  CONFIG_FILE: 'x86_64_mini.config'
+  TZ: Asia/Shanghai
+
+jobs:
+
+  build_openwrt:
+
+    name: Build OpenWrt Firmware
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Banner
+        run: |
+          echo "--------------------------CPU信息--------------------------"
+          echo "CPU物理数量:$(cat /proc/cpuinfo| grep "physical id"| sort| uniq| wc -l)"
+          echo -e "CPU核心及版本信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
+          echo "--------------------------内存信息--------------------------"
+          echo "已安装内存详细信息："
+          sudo lshw -short -C memory | grep GiB
+          echo -e "\n"
+          free -h
+          echo -e "\n"
+          echo "--------------------------硬盘信息--------------------------"
+          echo -e  "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l) \n"
+          echo "硬盘详情："
+          df -Th
+
+      - name: Space cleanup and Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set +e
+          docker rmi `docker images -q`
+          echo "Deleting files, please wait ..."
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /etc/mysql \
+            /etc/php
+          sudo -E apt-get -y purge \
+            azure-cli \
+            ghc* \
+            zulu* \
+            hhvm \
+            llvm* \
+            firefox \
+            google* \
+            dotnet* \
+            powershell \
+            openjdk* \
+            mysql* \
+            php*
+          sudo -E apt-get update
+          sudo -E apt-get -y install ack antlr3 aria2 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pip libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+
+      - name: Checkout
+        uses: actions/checkout@main
+
+      - name: Checkout OpenWrt
+        run: |
+          git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+
+      - name: Update feeds
+        run: |
+          mv ./diy-part1.sh openwrt/diy-part1.sh
+          cd openwrt
+          chmod +x ./diy-part1.sh && ./diy-part1.sh
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Custom configuration file
+        run: |
+          [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+          mv ./diy-part2.sh openwrt/diy-part2.sh
+          cd openwrt
+          chmod +x ./diy-part2.sh && ./diy-part2.sh
+
+      - name: SSH connection to Actions
+        if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh != 'false') || contains(github.event.action, 'ssh')
+        uses: P3TERX/ssh2actions@v1.0.0
+
+      - name: Generate configuration file
+        working-directory: ./openwrt
+        run: make defconfig
+
+      - name: Download packages
+        working-directory: ./openwrt
+        run: make download -j16
+
+      - name: Compile firmware
+        working-directory: ./openwrt
+        run: |
+          echo -e "$(nproc) thread compile"
+          make -j$(nproc) || make -j1 V=s
+          echo "======================="
+          echo "Space usage:"
+          echo "======================="
+          df -h
+          echo "======================="
+          du -h --max-depth=1 ./ --exclude=build_dir --exclude=bin
+          du -h --max-depth=1 ./build_dir
+          du -h --max-depth=1 ./bin
+          grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/CONFIG_TARGET_(.*)_DEVICE.*=y/\1/' > DEVICE_NAME
+          [ -s DEVICE_NAME ] && echo "DEVICE_NAME=$(cat DEVICE_NAME)" >> $GITHUB_ENV
+          echo "FILE_DATE=$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
+
+      - name: Prepare artifact
+        working-directory: ./openwrt
+        run: |
+          mkdir -p ./artifact/firmware
+          mkdir -p ./artifact/package
+          mkdir -p ./artifact/buildinfo
+          rm -rf $(find ./bin/targets/ -type d -name "packages")
+          cp -rf $(find ./bin/targets/ -type f) ./artifact/firmware/
+          cp -rf $(find ./bin/packages/ -type f -name "*.ipk") ./artifact/package/
+          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ./artifact/buildinfo/
+
+      # - name: Upload buildinfo
+      #   uses: actions/upload-artifact@v3
+      #   with:
+      #     name: OpenWrt_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}_buildinfo
+      #     path: ./openwrt/artifact/buildinfo/
+
+      # - name: Upload package
+      #   uses: actions/upload-artifact@v3
+      #   with:
+      #     name: OpenWrt_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}_package
+      #     path: ./openwrt/artifact/package/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v3
+        with:
+          name: OpenWrt_${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}_firmware
+          path: ./openwrt/artifact/firmware/
+
+      - name: Upload firmware to release
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "./openwrt/artifact/firmware/*"
+          tag: ${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
+          name: ${{ env.DEVICE_NAME }}_${{ env.FILE_DATE }}
+          token: ${{ secrets.ACCESS_TOKEN }}
+
+      - name: Delete workflow runs
+        uses: GitRML/delete-workflow-runs@main
+        with:
+          retain_days: 1
+          keep_minimum_runs: 3
+
+      - name: Remove old Releases
+        uses: dev-drprasad/delete-older-releases@v0.1.0
+        with:
+          keep_latest: 3
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.ACCESS_TOKEN }}
